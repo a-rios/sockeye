@@ -178,10 +178,12 @@ class InferenceModel(model.SockeyeModel):
             # encoder
             # source_encoded: (source_encoded_length, batch_size, encoder_depth)
             (source_encoded,
-             source_encoded_length,
-             source_encoded_seq_len) = self.encoder.encode(source_embed,
-                                                           source_embed_length,
-                                                           source_embed_seq_len)
+            source_encoded_length,
+            source_encoded_seq_len) = self.encoder.encode(source_embed,
+                                                          source_embed_length,
+                                                          source_embed_seq_len,
+                                                          source=source_words,
+                                                          separator_id=self.config.separator_id)
 
             # initial decoder states
             decoder_init_states = self.decoder.init_states(source_encoded,
@@ -253,7 +255,7 @@ class InferenceModel(model.SockeyeModel):
                 logits = self.output_layer(target_decoded)
                 if self.config.num_pointers:
                     logits = mx.sym.concat(logits, pointer_scores, dim=1)
-                
+
                 if self.softmax_temperature is not None:
                     logits = logits / self.softmax_temperature
                 if self.skip_softmax:
@@ -932,7 +934,9 @@ class TranslatorOutput:
                  'nbest_translations',
                  'nbest_tokens',
                  'nbest_attention_matrices',
-                 'nbest_scores')
+                 'nbest_scores',
+                 'monotonicity_score',
+                 'attention_percentage_position_increase')
 
     def __init__(self,
                  sentence_id: SentenceId,
@@ -945,7 +949,9 @@ class TranslatorOutput:
                  nbest_translations: Optional[List[str]] = None,
                  nbest_tokens: Optional[List[Tokens]] = None,
                  nbest_attention_matrices: Optional[List[np.ndarray]] = None,
-                 nbest_scores: Optional[List[float]] = None) -> None:
+                 nbest_scores: Optional[List[float]] = None,
+                 monotonicity_score: Optional[float] = None,
+                 attention_percentage_position_increase: Optional[float] = None) -> None:
         self.sentence_id = sentence_id
         self.translation = translation
         self.tokens = tokens
@@ -957,6 +963,8 @@ class TranslatorOutput:
         self.nbest_tokens = nbest_tokens
         self.nbest_attention_matrices = nbest_attention_matrices
         self.nbest_scores = nbest_scores
+        self.monotonicity_score = monotonicity_score
+        self.attention_percentage_position_increase = attention_percentage_position_increase
 
     def json(self, align_threshold: float = 0.0) -> Dict:
         """

@@ -73,7 +73,13 @@ class TrainingModel(model.SockeyeModel):
                  gradient_compression_params: Optional[Dict[str, Any]] = None,
                  gradient_accumulation: bool = False,
                  fixed_param_names: Optional[List[str]] = None,
-                 fixed_param_strategy: Optional[str] = None) -> None:
+                 fixed_param_strategy: Optional[str] = None,
+                 attention_monotonicity: Optional[bool] = False,
+                 attention_monotonicity_loss_lambda: Optional[float] = 0.0,
+                 attention_monotonicity_loss_margin: Optional[float] = 0.0,
+                 monotonicity_on_heads: Optional[ Tuple[int, int]] = None,
+                 monotonicity_on_layers: Optional[ Tuple[int, int]] = None,
+                 monotonicity_loss_normalize_by_source_length: Optional[bool] = False) -> None:
         super().__init__(config)
         self.context = context
         self.output_dir = output_dir
@@ -82,6 +88,12 @@ class TrainingModel(model.SockeyeModel):
         self._bucketing = bucketing
         self._gradient_compression_params = gradient_compression_params
         self._gradient_accumulation = gradient_accumulation
+        self._attention_monotonicity = attention_monotonicity
+        self._attention_monotonicity_loss_lambda = attention_monotonicity_loss_lambda
+        self._attention_monotonicity_loss_margin = attention_monotonicity_loss_margin
+        self._monotonicity_loss_normalize_by_source_length = monotonicity_loss_normalize_by_source_length
+        self._monotonicity_on_heads = monotonicity_on_heads
+        self._monotonicity_on_layers = monotonicity_on_layers
         self._initialize(provide_data, provide_label, default_bucket_key)
         self._monitor = None  # type: Optional[mx.monitor.Monitor]
 
@@ -99,6 +111,7 @@ class TrainingModel(model.SockeyeModel):
         target = mx.sym.Variable(C.TARGET_NAME)
         target_length = utils.compute_lengths(target)
         labels = mx.sym.reshape(data=mx.sym.Variable(C.TARGET_LABEL_NAME), shape=(-1,))
+        target_words = mx.sym.reshape(data=target, shape=(-1,), name="target_words")
 
         self.model_loss = loss.get_loss(self.config.config_loss)
         logger.info("Using model loss: %s", self.model_loss)
@@ -107,6 +120,9 @@ class TrainingModel(model.SockeyeModel):
             logger.info("Using length task loss: %s", self.length_task_loss)
         else:
             self.length_task_loss = None
+
+        if self._attention_monotonicity:
+            self.attention_monotonicity_loss = loss.get_loss(self.config.attention_monotonicity_config_loss)
 
         data_names = [C.SOURCE_NAME, C.TARGET_NAME]
         label_names = [C.TARGET_LABEL_NAME]
@@ -142,14 +158,17 @@ class TrainingModel(model.SockeyeModel):
             # encoder
             # source_encoded: (batch_size, source_encoded_length, encoder_depth)
             (source_encoded,
-             source_encoded_length,
-             source_encoded_seq_len) = self.encoder.encode(source_embed,
-                                                           source_embed_length,
-                                                           source_embed_seq_len)
+            source_encoded_length,
+            source_encoded_seq_len) = self.encoder.encode(source_embed,
+                                                          source_embed_length,
+                                                          source_embed_seq_len,
+                                                          source=source_words,
+                                                          separator_id=self.config.separator_id)
+
             # decoder
             # target_decoded: (batch-size, target_len, decoder_depth)
             # pointer_scores: (batch-size, target_seq_len, source_seq_len)
-            target_decoded, pointer_scores = self.decoder.decode_sequence(source_encoded, source_encoded_length, source_encoded_seq_len,
+            target_decoded, pointer_scores, attention_scores_list = self.decoder.decode_sequence(source_encoded, source_encoded_length, source_encoded_seq_len,
                                                           target_embed, target_embed_length, target_embed_seq_len)
 
             # target_decoded: (batch_size * target_seq_len, decoder_depth)
@@ -167,7 +186,7 @@ class TrainingModel(model.SockeyeModel):
                 logits = mx.sym.concat(logits, pointer_scores, dim=1)
             
             # 1) standard cross-entropy loss
-            net_outputs = [self.model_loss.get_loss(logits, labels)]
+            net_outputs = [self.model_loss.get_loss(logits=logits, labels=labels, grad_scale=1.0)] ## only scaling mono loss for now
             # 2) length task losses
             if self.length_task_loss is not None:
                 # predicted_length_ratios: (batch_size, 1)
@@ -183,7 +202,25 @@ class TrainingModel(model.SockeyeModel):
                                     mx.sym.BlockGrad(predicted_length_ratio, name=C.LENRATIO_NAME),
                                     mx.sym.BlockGrad(length_ratio, name=C.LENRATIO_LABEL_NAME)])
 
-            return mx.sym.Group(net_outputs), data_names, label_names
+
+            if self._attention_monotonicity:
+                num_attention_heads = 1
+                if hasattr(self.config.config_decoder, "attention_heads"):
+                    num_attention_heads = self.config.config_decoder.attention_heads
+                loss_attention = [self.attention_monotonicity_loss.get_loss(attention_scores_list=attention_scores_list,
+                                                                            num_attention_heads=num_attention_heads,
+                                                                            target_words=target_words,
+                                                                            source_words=source_words,
+                                                                            source_length=source_length,
+                                                                            target_length=target_length,
+                                                                            grad_scale=self._attention_monotonicity_loss_lambda,
+                                                                            margin=self._attention_monotonicity_loss_margin,
+                                                                            monotonicity_on_heads=self._monotonicity_on_heads,
+                                                                            monotonicity_on_layers=self._monotonicity_on_layers,
+                                                                            monotonicity_loss_normalize_by_source_length=self._monotonicity_loss_normalize_by_source_length)]
+                return mx.sym.Group(net_outputs + loss_attention), data_names, label_names
+            else:
+                return mx.sym.Group(net_outputs), data_names, label_names
 
         # Fix model parameters as needed for different training options.
         utils.check_condition(not self.config.lhuc or self.fixed_param_strategy is None,
@@ -693,6 +730,9 @@ class EarlyStoppingTrainer:
             logger.info("Training started.")
 
         metric_train, metric_val, metric_loss = self._create_metrics(metrics, self.model.optimizer, self.model.loss)
+        attention_monotonicity_loss = None
+        if hasattr(self.model, 'attention_monotonicity_loss')  and self.model.attention_monotonicity_loss:
+            attention_monotonicity_loss = self.model.attention_monotonicity_loss.create_metric()
 
         process_manager = None
         if decoder is not None:
@@ -733,7 +773,7 @@ class EarlyStoppingTrainer:
             ######
             batch = next_data_batch
             self.state.batches += 1
-            self._step(self.model, batch, checkpoint_interval, metric_train, metric_loss)
+            self._step(self.model, batch, checkpoint_interval, metric_train, metric_loss, attention_monotonicity_loss)
             batch_num_samples = batch.data[0].shape[0]
             batch_num_tokens = batch.data[0].shape[1] * batch_num_samples
             self.state.samples += batch_num_samples
@@ -746,7 +786,7 @@ class EarlyStoppingTrainer:
             self.model.prepare_batch(next_data_batch)
 
             speedometer(self.state.epoch, self.state.batches, self.state.updates,
-                        batch_num_samples, batch_num_tokens, metric_train)
+                        batch_num_samples, batch_num_tokens, metric_train, attention_monotonicity_loss)
 
             ############
             # CHECKPOINT
@@ -895,7 +935,8 @@ class EarlyStoppingTrainer:
               batch: mx.io.DataBatch,
               checkpoint_interval: int,
               metric_train: mx.metric.EvalMetric,
-              metric_loss: Optional[mx.metric.EvalMetric] = None):
+              metric_loss: Optional[mx.metric.EvalMetric] = None,
+              metric_attention_monotonicity_loss: Optional[mx.metric.EvalMetric] = None):
         """
         Performs an update to model given a batch and updates metrics.
         """
@@ -917,6 +958,11 @@ class EarlyStoppingTrainer:
             [(_, m_val)] = metric_loss.get_name_value()
             batch_state = BatchState(metric_val=m_val)
             optimizer.pre_update_batch(batch_state)
+
+        if metric_attention_monotonicity_loss is not None:
+            metric_attention_monotonicity_loss.reset()
+            outputs = model.module.get_outputs()
+            metric_attention_monotonicity_loss.update([model.module.get_outputs()[1]])
 
         ########
         # UPDATE
@@ -1330,7 +1376,7 @@ class Speedometer:
         self.msg = 'Epoch[%d] Batch [%d]\tSpeed: %.2f samples/sec %.2f tokens/sec %.2f updates/sec'
 
     def __call__(self, epoch: int, batches: int, updates: int, samples: int,
-                 tokens: int, metric: Optional[mx.metric.EvalMetric]):
+                 tokens: int, metric: Optional[mx.metric.EvalMetric], metric_attention_monotonicity_loss: Optional[mx.metric.EvalMetric]):
         count = batches
         if self.last_count > count:
             self.init = False
@@ -1352,7 +1398,15 @@ class Speedometer:
                     name_value = metric.get_name_value()
                     if self.auto_reset:
                         metric.reset()
-                    logger.info(self.msg + '\t%s=%f' * len(name_value),
+
+                    if metric_attention_monotonicity_loss is not None:
+                        attention_name_value = metric_attention_monotonicity_loss.get_name_value()
+                        if self.auto_reset:
+                            metric_attention_monotonicity_loss.reset()
+                        logger.info(self.msg + '\t%s=%f' + '\t%s=%f' * len(name_value),
+                                epoch, count, samples_per_sec, tokens_per_sec, updates_per_sec, *sum(name_value, ()), *sum(attention_name_value,()))
+                    else:
+                        logger.info(self.msg + '\t%s=%f' * len(name_value),
                                 epoch, count, samples_per_sec, tokens_per_sec, updates_per_sec, *sum(name_value, ()))
                 else:
                     logger.info(self.msg, epoch, count, samples_per_sec)

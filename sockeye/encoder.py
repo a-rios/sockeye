@@ -285,7 +285,9 @@ class ConvertLayout(Encoder):
     def encode(self,
                data: mx.sym.Symbol,
                data_length: Optional[mx.sym.Symbol],
-               seq_len: int) -> Tuple[mx.sym.Symbol, mx.sym.Symbol, int]:
+               seq_len: int,
+               source: Optional[mx.sym.Symbol],
+               separator_id: int = None) -> Tuple[mx.sym.Symbol, mx.sym.Symbol, int]:
         """
         Encodes data given sequence lengths of individual examples and maximum sequence length.
 
@@ -517,40 +519,71 @@ class AddSinCosPositionalEmbeddings(PositionalEncoder):
     def encode(self,
                data: mx.sym.Symbol,
                data_length: Optional[mx.sym.Symbol],
-               seq_len: int) -> Tuple[mx.sym.Symbol, mx.sym.Symbol, int]:
+               seq_len: int,
+               source: Optional[mx.sym.Symbol] = None,
+               separator_id: Optional[int] = None) -> Tuple[mx.sym.Symbol, mx.sym.Symbol, int]:
         """
         :param data: (batch_size, source_seq_len, num_embed)
         :param data_length: (batch_size,)
         :param seq_len: sequence length.
+        :param source: source ids (batch_size, source_seq_len, source_factors)
+        :param separator_id: integer id of separator token between tags and lemma (for morphological inflection task). Positional encodings will start at separator token with 0, positions to the right of it will have decreasing negative positions, e.g. -3 -2 -1 sep=0 1 2 3 4.
         :return: (batch_size, source_seq_len, num_embed)
         """
-        positions = mx.sym.arange(0, seq_len)
-        embedding = self.encode_positions(positions, data)
+        positions = mx.sym.arange(0, seq_len) # (src_len, )
+        source_token_positions = source
+        if separator_id is not None:
+            # get source tokens without factor dimension
+            # TODO does not work with factors
+            source_tokens = source.squeeze() # (batch, src_len)
+
+            # lookup positions of <sep>
+            source_token_positions = mx.sym.broadcast_mul(mx.sym.ones_like(source_tokens), positions) # (batch, src_len)
+            max_token_positions = mx.sym.broadcast_mul(mx.sym.ones_like(source_token_positions), mx.sym.max(source_token_positions)) # (batch, src_len)
+            match_indices = mx.sym.where(condition=(source_tokens == separator_id),
+                                         x=source_token_positions,
+                                         y=max_token_positions) # (batch, src_len)
+            separator_ids = mx.sym.min(match_indices, axis=1) # (batch,)
+
+            # update positions to start at 0 for <sep> token
+            positions = mx.sym.broadcast_sub(source_token_positions, mx.sym.expand_dims(separator_ids, axis=1)) # (batch, src_len)
+        embedding = self.encode_positions(positions, data, separator_id)
         return embedding, data_length, seq_len
 
     def encode_positions(self,
                          positions: mx.sym.Symbol,
-                         data: mx.sym.Symbol) -> mx.sym.Symbol:
+                         data: mx.sym.Symbol,
+                         separator_id: int = None) -> mx.sym.Symbol:
         """
         :param positions: (batch_size,)
         :param data: (batch_size, num_embed)
+        :param separator_id: integer id of separator token between tags and lemma (for morphological inflection task).
         :return: (batch_size, num_embed)
         """
-        # (batch_size, 1)
-        positions = mx.sym.expand_dims(positions, axis=1)
+        # TODO does not work with batch-size 1
+        if separator_id is not None:
+            # (batch_size, src_len, 1)
+            positions = mx.sym.expand_dims(positions, axis=2)
+        else:
+            # (src_len, 1)
+            positions = mx.sym.expand_dims(positions, axis=1)
         # (num_embed,)
         channels = mx.sym.arange(0, self.num_embed // 2)
         # (1, num_embed,)
         scaling = mx.sym.expand_dims(1. / mx.sym.pow(10000, (2 * channels) / self.num_embed), axis=0)
 
-        # (batch_size, num_embed/2)
+        # (batch_size, src_len ?, num_embed/2)
         scaled_positions = mx.sym.dot(positions, scaling)
 
         sin = mx.sym.sin(scaled_positions)
         cos = mx.sym.cos(scaled_positions)
 
-        # (batch_size, num_embed)
-        pos_embedding = mx.sym.concat(sin, cos, dim=1)
+        if separator_id is not None:
+            # (batch_size, src_len, num_embed)
+            pos_embedding = mx.sym.concat(sin, cos, dim=2)
+        else:
+            # (src_len, num_embed)
+            pos_embedding = mx.sym.concat(sin, cos, dim=1)
 
         if self.scale_up_input:
             data = data * (self.num_embed ** 0.5)
@@ -717,7 +750,9 @@ class EncoderSequence(Encoder):
     def encode(self,
                data: mx.sym.Symbol,
                data_length: mx.sym.Symbol,
-               seq_len: int) -> Tuple[mx.sym.Symbol, mx.sym.Symbol, int]:
+               seq_len: int,
+               source: Optional[mx.sym.Symbol] = None,
+               separator_id: Optional[int] = None) -> Tuple[mx.sym.Symbol, mx.sym.Symbol, int]:
         """
         Encodes data given sequence lengths of individual examples and maximum sequence length.
 
@@ -727,7 +762,7 @@ class EncoderSequence(Encoder):
         :return: Encoded versions of input data (data, data_length, seq_len).
         """
         for encoder in self.encoders:
-            data, data_length, seq_len = encoder.encode(data, data_length, seq_len)
+            data, data_length, seq_len = encoder.encode(data, data_length, seq_len, source=source, separator_id=separator_id)
         return data, data_length, seq_len
 
     def get_num_hidden(self) -> int:
@@ -830,16 +865,20 @@ class RecurrentEncoder(Encoder):
     def encode(self,
                data: mx.sym.Symbol,
                data_length: Optional[mx.sym.Symbol],
-               seq_len: int) -> Tuple[mx.sym.Symbol, mx.sym.Symbol, int]:
+               seq_len: int,
+               source: Optional[mx.sym.Symbol],
+               separator_id: int = None) -> Tuple[mx.sym.Symbol, mx.sym.Symbol, int]:
         """
         Encodes data given sequence lengths of individual examples and maximum sequence length.
 
         :param data: Input data.
         :param data_length: Vector with sequence lengths.
         :param seq_len: Maximum sequence length.
+        :param source: source ids (batch_size, source_seq_len, source_factors)
+        :param separator_id: integer id of separator token between tags and lemma (for morphological inflection task).
         :return: Encoded versions of input data (data, data_length, seq_len).
         """
-        
+
         # The following piece of code illustrates how to unroll the RNN cell(s) over time independent of seq_len,
         # using the new control-flow operator foreach. It works, but shape inference fails when using
         # the VariationalDropout cell. ATM it is unclear how to fix it.
@@ -912,23 +951,27 @@ class BiDirectionalRNNEncoder(Encoder):
     def encode(self,
                data: mx.sym.Symbol,
                data_length: mx.sym.Symbol,
-               seq_len: int) -> Tuple[mx.sym.Symbol, mx.sym.Symbol, int]:
+               seq_len: int,
+               source: Optional[mx.sym.Symbol],
+               separator_id: int = None) -> Tuple[mx.sym.Symbol, mx.sym.Symbol, int]:
         """
         Encodes data given sequence lengths of individual examples and maximum sequence length.
 
         :param data: Input data.
         :param data_length: Vector with sequence lengths.
         :param seq_len: Maximum sequence length.
+        :param source: source ids (batch_size, source_seq_len, source_factors)
+        :param separator_id: integer id of separator token between tags and lemma (for morphological inflection task).
         :return: Encoded versions of input data (data, data_length, seq_len).
         """
         if self.layout[0] == 'N':
             data = mx.sym.swapaxes(data=data, dim1=0, dim2=1)
-        data = self._encode(data, data_length, seq_len)
+        data = self._encode(data, data_length, seq_len, source, separator_id)
         if self.layout[0] == 'N':
             data = mx.sym.swapaxes(data=data, dim1=0, dim2=1)
         return data, data_length, seq_len
 
-    def _encode(self, data: mx.sym.Symbol, data_length: mx.sym.Symbol, seq_len: int) -> mx.sym.Symbol:
+    def _encode(self, data: mx.sym.Symbol, data_length: mx.sym.Symbol, seq_len: int, source: Optional[mx.sym.Symbol], separator_id: int = None) -> mx.sym.Symbol:
         """
         Bidirectionally encodes time-major data.
         """
@@ -936,9 +979,9 @@ class BiDirectionalRNNEncoder(Encoder):
         data_reverse = mx.sym.SequenceReverse(data=data, sequence_length=data_length,
                                               use_sequence_length=True)
         # (seq_length, batch, cell_num_hidden)
-        hidden_forward, _, _ = self.forward_rnn.encode(data, data_length, seq_len)
+        hidden_forward, _, _ = self.forward_rnn.encode(data, data_length, seq_len, source, separator_id)
         # (seq_length, batch, cell_num_hidden)
-        hidden_reverse, _, _ = self.reverse_rnn.encode(data_reverse, data_length, seq_len)
+        hidden_reverse, _, _ = self.reverse_rnn.encode(data_reverse, data_length, seq_len, source, separator_id)
         # (seq_length, batch, cell_num_hidden)
         hidden_reverse = mx.sym.SequenceReverse(data=hidden_reverse, sequence_length=data_length,
                                                 use_sequence_length=True)
@@ -1045,7 +1088,7 @@ class TransformerEncoder(Encoder, mx.gluon.HybridBlock):
     def hybrid_forward(self, F, data, data_length):
         return self._encode(F, data, data_length)
 
-    def _encode(self, F, data: mx.sym.Symbol, data_length: mx.sym.Symbol) -> mx.sym.Symbol:
+    def _encode(self, F, data: mx.sym.Symbol, data_length: mx.sym.Symbol, source: Optional[mx.sym.Symbol] = None) -> mx.sym.Symbol:
         data = utils.cast_conditionally(F, data, self.dtype)
         if self.config.dropout_prepost > 0.0:
             data = F.Dropout(data=data, p=self.config.dropout_prepost)
@@ -1063,13 +1106,17 @@ class TransformerEncoder(Encoder, mx.gluon.HybridBlock):
     def encode(self,
                data: mx.sym.Symbol,
                data_length: Optional[mx.sym.Symbol],
-               seq_len: int):
+               seq_len: int,
+               source: Optional[mx.sym.Symbol] = None,
+               separator_id: Optional[int] = None):
         """
         Encodes data given sequence lengths of individual examples and maximum sequence length.
 
         :param data: Input data.
         :param data_length: Vector with sequence lengths.
         :param seq_len: Maximum sequence length.
+        :param source: source ids (batch_size, source_seq_len, source_factors)
+        :param separator_id: integer id of separator token between tags and lemma (for morphological inflection task).
         :return: Encoded versions of input data data, data_length, seq_len.
         """
         return self._encode(mx.sym, data, data_length), data_length, seq_len

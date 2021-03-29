@@ -99,10 +99,15 @@ def check_arg_compatibility(args: argparse.Namespace):
     if args.decoder_only:
         check_condition(args.decoder != C.TRANSFORMER_TYPE and args.decoder != C.CONVOLUTION_TYPE,
                         "Decoder pre-training currently supports RNN decoders only.")
-    
+
     if args.attention_based_copying:
         check_condition(args.decoder == C.RNN_NAME,
                         "The attention-based copying mechanism currently supports RNN decoders only.")
+
+    if args.monotonicity_on_heads is not None:
+        check_condition(args.monotonicity_on_heads[1] <= args.transformer_attention_heads[1],
+                        "Attention monotonicity loss on n-m heads, m cannot be larger than --transformer-attention-heads for decoder (use None to apply loss to all attention heads).")
+
 
 
 def check_resume(args: argparse.Namespace, output_folder: str) -> bool:
@@ -185,7 +190,8 @@ def create_checkpoint_decoder(args: argparse.Namespace,
                                                 inputs=[args.validation_source] + args.validation_source_factors,
                                                 references=args.validation_target,
                                                 model=args.output,
-                                                sample_size=sample_size)
+                                                sample_size=sample_size,
+                                                beam_size=args.checkpoint_decoder_beam_size)
 
 
 def use_shared_vocab(args: argparse.Namespace) -> bool:
@@ -397,6 +403,7 @@ def create_encoder_config(args: argparse.Namespace,
             act_type=args.transformer_activation_type,
             num_layers=encoder_num_layers,
             dropout_attention=args.transformer_dropout_attention,
+            drophead_attention=args.transformer_drophead_attention,
             dropout_act=args.transformer_dropout_act,
             dropout_prepost=args.transformer_dropout_prepost,
             positional_embedding_type=args.transformer_positional_embedding_type,
@@ -405,6 +412,7 @@ def create_encoder_config(args: argparse.Namespace,
             max_seq_len_source=max_seq_len_source,
             max_seq_len_target=max_seq_len_target,
             conv_config=config_conv,
+            attention_monotonicity=args.attention_monotonicity,
             lhuc=args.lhuc is not None and (C.LHUC_ENCODER in args.lhuc or C.LHUC_ALL in args.lhuc))
         encoder_num_hidden = encoder_transformer_model_size
     elif args.encoder == C.CONVOLUTION_TYPE:
@@ -474,6 +482,7 @@ def create_decoder_config(args: argparse.Namespace, encoder_num_hidden: int,
             act_type=args.transformer_activation_type,
             num_layers=decoder_num_layers,
             dropout_attention=args.transformer_dropout_attention,
+            drophead_attention=args.transformer_drophead_attention,
             dropout_act=args.transformer_dropout_act,
             dropout_prepost=args.transformer_dropout_prepost,
             positional_embedding_type=args.transformer_positional_embedding_type,
@@ -482,7 +491,8 @@ def create_decoder_config(args: argparse.Namespace, encoder_num_hidden: int,
             max_seq_len_source=max_seq_len_source,
             max_seq_len_target=max_seq_len_target,
             conv_config=None,
-            lhuc=args.lhuc is not None and (C.LHUC_DECODER in args.lhuc or C.LHUC_ALL in args.lhuc))
+            lhuc=args.lhuc is not None and (C.LHUC_DECODER in args.lhuc or C.LHUC_ALL in args.lhuc),
+            return_dec_enc_att_probs=args.attention_monotonicity)
 
     elif args.decoder == C.CONVOLUTION_TYPE:
         if args.decoder_only:
@@ -623,7 +633,8 @@ def create_model_config(args: argparse.Namespace,
                         target_vocab_size: int,
                         max_seq_len_source: int,
                         max_seq_len_target: int,
-                        config_data: data_io.DataConfig) -> model.ModelConfig:
+                        config_data: data_io.DataConfig,
+                        separator_id: Optional[int] = None) -> model.ModelConfig:
     """
     Create a ModelConfig from the argument given in the command line.
 
@@ -691,6 +702,16 @@ def create_model_config(args: argparse.Namespace,
                                   normalization_type=args.loss_normalization_type,
                                   label_smoothing=args.label_smoothing)
 
+    attention_monotonicity_config_loss = None
+    if args.attention_monotonicity:
+        attention_monotonicity_config_loss = loss.LossConfig(name='monotone-attention-loss',
+                                  vocab_size=None,
+                                  normalization_type=None,
+                                  label_smoothing=None,
+                                  separator_id=separator_id,
+                                  margin=args.attention_monotonicity_loss_margin,
+                                  monotonicity_on_heads=args.monotonicity_on_heads)
+
     if args.length_task is not None:
         config_length_task = layers.LengthRatioConfig(num_layers=args.length_task_layers, weight=args.length_task_weight)
         link = C.LINK_NORMAL if args.length_task == C.LENGTH_TASK_RATIO else C.LINK_POISSON
@@ -715,7 +736,10 @@ def create_model_config(args: argparse.Namespace,
                                      weight_tying_type=args.weight_tying_type if args.weight_tying else None,
                                      weight_normalization=args.weight_normalization,
                                      lhuc=args.lhuc is not None,
-                                     num_pointers=num_pointers)
+                                     num_pointers=num_pointers,
+                                     attention_monotonicity=args.attention_monotonicity,
+                                     attention_monotonicity_config_loss=attention_monotonicity_config_loss,
+                                     separator_id=separator_id)
     return model_config
 
 
@@ -744,7 +768,16 @@ def create_training_model(config: model.ModelConfig,
                                             gradient_compression_params=gradient_compression_params(args),
                                             gradient_accumulation=args.update_interval > 1,
                                             fixed_param_names=args.fixed_param_names,
-                                            fixed_param_strategy=args.fixed_param_strategy)
+                                            fixed_param_strategy=args.fixed_param_strategy,
+                                            attention_monotonicity=args.attention_monotonicity,
+                                            attention_monotonicity_loss_lambda=args.attention_monotonicity_loss_lambda,
+                                            attention_monotonicity_loss_margin=args.attention_monotonicity_loss_margin,
+                                            monotonicity_on_heads=args.monotonicity_on_heads,
+                                            monotonicity_on_layers=args.monotonicity_on_layers,
+                                            monotonicity_loss_normalize_by_source_length=args.attention_monotonicity_loss_normalize_by_source_length)
+
+
+
 
     return training_model
 
@@ -803,7 +836,7 @@ def create_optimizer_config(args: argparse.Namespace, source_vocab_sizes: List[i
                                               default_init_xavier_rand_type=args.weight_init_xavier_rand_type,
                                               default_init_xavier_factor_type=args.weight_init_xavier_factor_type,
                                               embed_init_type=args.embed_weight_init,
-                                              embed_init_sigma=source_vocab_sizes[0] ** -0.5,
+                                              embed_init_sigma=args.num_embed[0] ** -0.5,
                                               rnn_init_type=args.rnn_h2h_init,
                                               extra_initializers=extra_initializers)
 
@@ -845,7 +878,7 @@ def train(args: argparse.Namespace, custom_metrics_logger: Optional[Callable] = 
                                   during training in a custom way. It should accept a dictionary of
                                   metric name -> metric value pairs and a global_step/checkpoint parameter.
     :param checkpoint_callback: An optional callback function (int -> None). The function will be called
-                                each time a checkpoint has been reached 
+                                each time a checkpoint has been reached
     """
     if args.dry_run:
         # Modify arguments so that we write to a temporary directory and
@@ -901,6 +934,10 @@ def train(args: argparse.Namespace, custom_metrics_logger: Optional[Callable] = 
         max_seq_len_source = config_data.max_seq_len_source
         max_seq_len_target = config_data.max_seq_len_target
 
+        separator_id = None
+        if args.attention_monotonicity_ignore_prefix:
+            separator_id = source_vocabs[0][C.SEP_ID]
+
         # Dump the vocabularies if we're just starting up
         if not resume_training:
             vocab.save_source_vocabs(source_vocabs, output_folder)
@@ -915,7 +952,8 @@ def train(args: argparse.Namespace, custom_metrics_logger: Optional[Callable] = 
         model_config = create_model_config(args=args,
                                            source_vocab_sizes=source_vocab_sizes, target_vocab_size=target_vocab_size,
                                            max_seq_len_source=max_seq_len_source, max_seq_len_target=max_seq_len_target,
-                                           config_data=config_data)
+                                           config_data=config_data,
+                                           separator_id=separator_id)
         model_config.freeze()
 
         training_model = create_training_model(config=model_config,

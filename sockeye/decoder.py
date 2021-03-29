@@ -273,11 +273,13 @@ class TransformerDecoder(Decoder):
         if self.config.dropout_prepost > 0.0:
             target = mx.sym.Dropout(data=target, p=self.config.dropout_prepost)
 
+        attention_scores_list = [] # length: layers, attention_scores shape: (batch_size * attention_heads, target_length, source_length)
         for layer in self.layers:
-            target = layer(target, target_bias, source_encoded, source_bias)
+            target, attention_scores = layer(target, target_bias, source_encoded, source_bias)
+            attention_scores_list.append(attention_scores)
         target = self.final_process(target, None)
 
-        return target, None
+        return target, None, attention_scores_list
 
     def decode_step(self,
                     step: int,
@@ -320,7 +322,7 @@ class TransformerDecoder(Decoder):
         new_states = [source_encoded, source_encoded_lengths]
         layer_caches = self._get_cache_per_layer(cast(List[mx.sym.Symbol], cache))
         for layer, layer_cache in zip(self.layers, layer_caches):
-            target = layer(target, target_bias, source_encoded, source_bias, layer_cache)
+            target, att_probs = layer(target, target_bias, source_encoded, source_bias, layer_cache)
             # store updated keys and values in states list.
             # (layer.__call__() has the side-effect of updating contents of layer_cache)
             new_states += [layer_cache['k'], layer_cache['v']]
@@ -330,8 +332,7 @@ class TransformerDecoder(Decoder):
         # (batch_size, model_size)
         target = mx.sym.reshape(target, shape=(-3, -1))
 
-        # TODO(fhieber): no attention probs for now
-        attention_probs = mx.sym.sum(mx.sym.zeros_like(source_encoded), axis=2, keepdims=False)
+        attention_probs = att_probs.squeeze()
 
         return target, attention_probs, new_states, None
 
@@ -601,6 +602,7 @@ class RecurrentDecoder(Decoder):
         # hidden_all: target_embed_max_length * (batch_size, rnn_num_hidden)
         hidden_states = []  # type: List[mx.sym.Symbol]
         attention_scores = []  # type: List[mx.sym.Symbol]
+        attention_probs = []
         
         # TODO: possible alternative: feed back the context vector instead of the hidden (see lamtram)
         self.reset()
@@ -614,11 +616,13 @@ class RecurrentDecoder(Decoder):
                                                 enc_last_hidden=enc_last_hidden)
             hidden_states.append(state.hidden)
             attention_scores.append(attention_state.scores)
+            attention_probs.append(attention_state.probs)
 
         # concatenate along time axis: (batch_size, target_embed_max_length, rnn_num_hidden)
         hidden_stack = mx.sym.stack(*hidden_states, axis=1, name='%shidden_stack' % self.prefix)
         attention_scores_stack = mx.sym.stack(*attention_scores, axis=1, name='%sattention_scores_stack' % self.prefix)
-        return hidden_stack, attention_scores_stack
+        attention_probs_stack = mx.sym.stack(*attention_probs, axis=1, name='%sattention_probs_stack' % self.prefix) # (batch, target_len, src_len)
+        return hidden_stack, attention_scores_stack, [attention_probs_stack]
 
     def decode_step(self,
                     step: int,

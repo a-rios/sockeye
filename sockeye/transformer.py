@@ -32,6 +32,7 @@ class TransformerConfig(config.Config):
                  act_type: str,
                  num_layers: int,
                  dropout_attention: float,
+                 drophead_attention: float,
                  dropout_act: float,
                  dropout_prepost: float,
                  positional_embedding_type: str,
@@ -41,7 +42,9 @@ class TransformerConfig(config.Config):
                  max_seq_len_target: int,
                  conv_config: Optional['encoder.ConvolutionalEmbeddingConfig'] = None,
                  lhuc: bool = False,
-                 dtype: str = C.DTYPE_FP32) -> None:  # type: ignore
+                 dtype: str = C.DTYPE_FP32,
+                 return_dec_enc_att_probs: Optional[bool] = False,
+                 attention_monotonicity: Optional[bool] = False) -> None:  # type: ignore
         super().__init__()
         self.model_size = model_size
         self.attention_heads = attention_heads
@@ -49,6 +52,7 @@ class TransformerConfig(config.Config):
         self.act_type = act_type
         self.num_layers = num_layers
         self.dropout_attention = dropout_attention
+        self.drophead_attention = drophead_attention
         self.dropout_act = dropout_act
         self.dropout_prepost = dropout_prepost
         self.positional_embedding_type = positional_embedding_type
@@ -59,6 +63,8 @@ class TransformerConfig(config.Config):
         self.conv_config = conv_config
         self.use_lhuc = lhuc
         self.dtype = dtype
+        self.return_dec_enc_att_probs = return_dec_enc_att_probs
+        self.attention_monotonicity = attention_monotonicity
 
 
 class TransformerEncoderBlock(mx.gluon.HybridBlock):
@@ -80,6 +86,7 @@ class TransformerEncoderBlock(mx.gluon.HybridBlock):
                                                                 heads=config.attention_heads,
                                                                 depth_out=config.model_size,
                                                                 dropout=config.dropout_attention,
+                                                                drophead=config.drophead_attention,
                                                                 prefix="att_self_")
             self.post_self_attention = TransformerProcessBlock(sequence=config.postprocess_sequence,
                                                                dropout=config.dropout_prepost,
@@ -133,6 +140,7 @@ class TransformerDecoderBlock(mx.gluon.HybridBlock):
                                                                 heads=config.attention_heads,
                                                                 depth_out=config.model_size,
                                                                 dropout=config.dropout_attention,
+                                                                drophead=config.drophead_attention,
                                                                 prefix="att_self_")
             self.post_self_attention = TransformerProcessBlock(sequence=config.postprocess_sequence,
                                                                dropout=config.dropout_prepost,
@@ -145,7 +153,9 @@ class TransformerDecoderBlock(mx.gluon.HybridBlock):
                                                            heads=config.attention_heads,
                                                            depth_out=config.model_size,
                                                            dropout=config.dropout_attention,
-                                                           prefix="att_enc_")
+                                                           drophead=config.drophead_attention,
+                                                           prefix="att_enc_",
+                                                           return_probs=config.return_dec_enc_att_probs)
             self.post_enc_attention = TransformerProcessBlock(sequence=config.postprocess_sequence,
                                                               dropout=config.dropout_prepost,
                                                               prefix="att_enc_post_")
@@ -176,8 +186,8 @@ class TransformerDecoderBlock(mx.gluon.HybridBlock):
         target_self_att = self.self_attention(self.pre_self_attention(target, None), None, target_bias, cache)
         target = self.post_self_attention(target_self_att, target)
 
-        # encoder attention
-        target_enc_att = self.enc_attention(self.pre_enc_attention(target, None), source, None, source_bias)
+        # target_enc_att: shape (batch, query_max_length, output_depth), attention_scores: (batch*heads, query_length, key_length)
+        target_enc_att, attention_scores = self.enc_attention(self.pre_enc_attention(target, None), source, None, source_bias)
         target = self.post_enc_attention(target_enc_att, target)
 
         # feed-forward
@@ -187,7 +197,7 @@ class TransformerDecoderBlock(mx.gluon.HybridBlock):
         if self.lhuc:
             target = self.lhuc(target)
 
-        return target
+        return target, attention_scores
 
 
 class TransformerProcessBlock(mx.gluon.nn.HybridBlock):

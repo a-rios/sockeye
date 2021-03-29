@@ -114,6 +114,14 @@ def score(args: argparse.Namespace):
             args=args,
             model_folder=args.model)
 
+        attention_monotonicity_scoring_margin=0.0
+        if args.attention_monotonicity_scoring:
+            if args.attention_monotonicity_scoring_margin is not None:
+                attention_monotonicity_scoring_margin = args.attention_monotonicity_scoring_margin
+            # no margin given, take margin from model config if model was trained with monotonicity loss
+            elif args.attention_monotonicity_scoring_margin is None and hasattr(model_config, "attention_monotonicity") and model_config.attention_monotonicity:
+                attention_monotonicity_scoring_margin = model_config.attention_monotonicity_config_loss.margin
+
         scoring_model = scoring.ScoringModel(config=model_config,
                                              model_dir=args.model,
                                              context=context,
@@ -126,13 +134,24 @@ def score(args: argparse.Namespace):
                                              brevity_penalty=inference.BrevityPenalty(weight=args.brevity_penalty_weight),
                                              softmax_temperature=args.softmax_temperature,
                                              brevity_penalty_type=args.brevity_penalty_type,
-                                             constant_length_ratio=args.brevity_penalty_constant_length_ratio)
+                                             constant_length_ratio=args.brevity_penalty_constant_length_ratio,
+                                             attention_monotonicity_scoring=args.attention_monotonicity_scoring,
+                                             attention_monotonicity_scoring_margin=attention_monotonicity_scoring_margin,
+                                             monotonicity_on_heads=args.monotonicity_scoring_on_heads,
+                                             monotonicity_on_layers=args.monotonicity_scoring_on_layers,
+                                             checkpoint=args.checkpoint)
 
         scorer = scoring.Scorer(scoring_model, source_vocabs, target_vocab)
-
-        scorer.score(score_iter=score_iter,
-                     output_handler=get_output_handler(output_type=args.output_type,
-                                                       output_fname=args.output))
+        if args.print_attention_scores:
+            scorer.score(score_iter=score_iter,
+                            output_handler=get_output_handler(output_type=args.output_type,
+                                                            output_fname=args.output),
+                            attention_handler=get_output_handler(output_type=C.OUTPUT_HANDLER_ALIGN_PLOT_TRS,
+                                                            output_fname=args.output))
+        else:
+            scorer.score(score_iter=score_iter,
+                        output_handler=get_output_handler(output_type=args.output_type,
+                                                        output_fname=args.output))
 
 
 if __name__ == "__main__":

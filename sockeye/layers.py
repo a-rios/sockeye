@@ -383,14 +383,17 @@ def broadcast_to_heads(F, x: mx.sym.Symbol, num_heads: int, ndim: int, fold_head
         # x: (batch, heads, dims...)
         return x
 
-
 class DotAttentionCell(mx.gluon.HybridBlock):
 
-    def __init__(self, dropout: float = 0.0, prefix: str = '') -> None:
+    def __init__(self,
+                 dropout: float = 0.0,
+                 drophead: float = 0.0,
+                 prefix: str = '') -> None:
         super().__init__(prefix=prefix)
         self.dropout = dropout
+        self.drophead = drophead
 
-    def hybrid_forward(self, F, queries, keys, values, lengths=None, bias=None):
+    def hybrid_forward(self, F, queries, keys, values, lengths=None, bias=None, return_probs: Optional[bool] = False):
         utils.check_condition(lengths is not None or bias is not None,
                               "Must provide either length or bias argument for masking")
         # (n, lq, lk)
@@ -412,9 +415,10 @@ class DotAttentionCell(mx.gluon.HybridBlock):
 
         probs = F.softmax(logits, axis=-1)
         probs = F.Dropout(probs, p=self.dropout) if self.dropout > 0.0 else probs
+        probs = F.Dropout(probs, p=self.drophead, axes=(1,2)) if self.drophead > 0.0 else probs # dropout only applied to entire heads
 
         # (n, lq, lk) x (n, lk, dv) -> (n, lq, dv)
-        return F.batch_dot(lhs=probs, rhs=values)
+        return F.batch_dot(lhs=probs, rhs=values), probs
 
 
 class MultiHeadAttentionBase(mx.gluon.HybridBlock):
@@ -426,13 +430,17 @@ class MultiHeadAttentionBase(mx.gluon.HybridBlock):
     :param heads: Number of attention heads.
     :param depth_out: Output depth / number of output units.
     :param dropout: Dropout probability on attention scores
+    :param drophead: Drop whole head with given probability, see https://www.aclweb.org/anthology/2020.findings-emnlp.178.pdf.
+    :param return_probs: return softmaxed attention scores.
     """
     def __init__(self,
                  prefix: str,
                  depth_att: int = 512,
                  heads: int = 8,
                  depth_out: int = 512,
-                 dropout: float = 0.0) -> None:
+                 dropout: float = 0.0,
+                 drophead: float = 0.0,
+                 return_probs: Optional[bool]= False) -> None:
         super().__init__(prefix=prefix)
         utils.check_condition(depth_att % heads == 0,
                               "Number of heads (%d) must divide attention depth (%d)" % (heads, depth_att))
@@ -440,9 +448,10 @@ class MultiHeadAttentionBase(mx.gluon.HybridBlock):
         self.heads = heads
         self.depth_out = depth_out
         self.depth_per_head = self.depth // self.heads
+        self.return_probs =return_probs
 
         with self.name_scope():
-            self.dot_att = DotAttentionCell(dropout=dropout, prefix='dot_att')
+            self.dot_att = DotAttentionCell(dropout=dropout, drophead=drophead, prefix='dot_att')
             self.ff_out = mx.gluon.nn.Dense(units=depth_out, flatten=False, use_bias=False, prefix='h2o_')
 
     def _attend(self,
@@ -472,15 +481,14 @@ class MultiHeadAttentionBase(mx.gluon.HybridBlock):
         lengths = broadcast_to_heads(F, lengths, self.heads, ndim=1, fold_heads=True) if lengths is not None else lengths
 
         # (batch*heads, query_max_length, depth_per_head)
-        contexts = self.dot_att(queries, keys, values, lengths, bias)
+        contexts, probs = self.dot_att(queries, keys, values, lengths, bias)
 
         # (batch, query_max_length, depth)
         contexts = combine_heads(F, contexts, self.depth_per_head, self.heads)
 
-        # contexts: (batch, query_max_length, output_depth)
+        # contexts: (batch, query_max_length, output_depth), probs: (batch_size * attention_heads, target_length, source_length)
         contexts = self.ff_out(contexts)
-
-        return contexts
+        return contexts, probs
 
 
 class MultiHeadSelfAttention(MultiHeadAttentionBase):
@@ -493,14 +501,16 @@ class MultiHeadSelfAttention(MultiHeadAttentionBase):
     :param heads: Number of attention heads.
     :param depth_out: Output depth / number of output units.
     :param dropout: Dropout probability on attention scores
+    :param drophead: Drop whole head with given probability, see https://www.aclweb.org/anthology/2020.findings-emnlp.178.pdf.
     """
     def __init__(self,
                  prefix: str,
                  depth_att: int = 512,
                  heads: int = 8,
                  depth_out: int = 512,
-                 dropout: float = 0.0) -> None:
-        super().__init__(prefix, depth_att, heads, depth_out, dropout)
+                 dropout: float = 0.0,
+                 drophead: float = 0.0) -> None:
+        super().__init__(prefix, depth_att, heads, depth_out, dropout, drophead)
 
         with self.name_scope():
             self.ff_in = mx.gluon.nn.Dense(units=depth_att * 3, flatten=False, use_bias=False, prefix='i2h_')
@@ -536,7 +546,8 @@ class MultiHeadSelfAttention(MultiHeadAttentionBase):
             keys = cache['k'] = keys if cache['k'] is None else F.concat(cache['k'], keys, dim=1)
             values = cache['v'] = values if cache['v'] is None else F.concat(cache['v'], values, dim=1)
 
-        return self._attend(F, queries, keys, values, lengths=input_lengths, bias=bias)
+        contexts , probs = self._attend(F, queries, keys, values, lengths=input_lengths, bias=bias)
+        return contexts
 
 
 class MultiHeadAttention(MultiHeadAttentionBase):
@@ -548,6 +559,8 @@ class MultiHeadAttention(MultiHeadAttentionBase):
     :param heads: Number of attention heads.
     :param depth_out: Output depth / number of output units.
     :param dropout: Dropout probability on attention scores
+    :param drophead: Drop whole head with given probability, see https://www.aclweb.org/anthology/2020.findings-emnlp.178.pdf.
+    :param return_probs: return softmaxed attention scores.
     """
 
     def __init__(self,
@@ -555,8 +568,10 @@ class MultiHeadAttention(MultiHeadAttentionBase):
                  depth_att: int = 512,
                  heads: int = 8,
                  depth_out: int = 512,
-                 dropout: float = 0.0) -> None:
-        super().__init__(prefix, depth_att, heads, depth_out, dropout)
+                 dropout: float = 0.0,
+                 drophead: float = 0.0,
+                 return_probs: Optional[bool] =False) -> None:
+        super().__init__(prefix, depth_att, heads, depth_out, dropout, drophead, return_probs)
 
         with self.name_scope():
             self.ff_q = mx.gluon.nn.Dense(units=depth_att, flatten=False, use_bias=False, prefix='q2h_')
@@ -586,8 +601,9 @@ class MultiHeadAttention(MultiHeadAttentionBase):
         keys = self.ff_k(memory)
         # (batch, memory_max_length, depth)
         values = self.ff_v(memory)
-
-        return self._attend(F, queries, keys, values, bias=bias, lengths=memory_lengths)
+        # probs: (batch_size * attention_heads, target_length, source_length)
+        context, probs = self._attend(F, queries, keys, values, bias=bias, lengths=memory_lengths)
+        return context, probs
 
 
 class PlainDotAttention(mx.gluon.HybridBlock):

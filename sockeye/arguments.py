@@ -980,6 +980,10 @@ def add_training_args(params):
                               type=float,
                               default=0.1,
                               help='Dropout probability for multi-head attention. Default: %(default)s.')
+    train_params.add_argument('--transformer-drophead-attention',
+                              type=float,
+                              default=0.0,
+                              help='Dropout probability for dropping out entire heads in multi-head attention. Default: %(default)s.')
     train_params.add_argument('--transformer-dropout-act',
                               type=float,
                               default=0.1,
@@ -1048,7 +1052,7 @@ def add_training_args(params):
                               default=C.EMBED_INIT_DEFAULT,
                               choices=C.EMBED_INIT_TYPES,
                               help='Type of embedding matrix weight initialization. If normal, initializes embedding '
-                                   'weights using a normal distribution with std=1/srqt(vocab_size). '
+                                   'weights using a normal distribution with std=1/srqt(num_embed). '
                                    'Default: %(default)s.')
     train_params.add_argument('--initial-learning-rate',
                               type=float,
@@ -1172,6 +1176,61 @@ def add_training_args(params):
                               help="Do not perform any actual training, but print statistics about the model"
                               " and mode of operation.")
 
+def add_monotonicity_loss_args(params):
+    params = params.add_argument_group("Parameters for learning multilingual positional embeddings")
+    params.add_argument('--attention-monotonicity',
+                              action='store_true',
+                              help="Use additional loss to encourage monotone decoder-encoder attention. Default: %(default)s")
+    params.add_argument('--attention-monotonicity-loss-lambda',
+                              type=float,
+                              default=0.0,
+                              help='Scale monotone attention loss by lambda, CE loss will not be scaled (lambda = 0: log loss but do not use it for training). Default: %(default)s.')
+    params.add_argument('--attention-monotonicity-loss-margin',
+                              type=float,
+                              default=0.0,
+                              help='Expected margin for attention increase to be considered monotone (scaled by source/target length ratio). Default: %(default)s.')
+    params.add_argument('--attention-monotonicity-loss-normalize-by-source-length',
+                              action='store_true',
+                              help='In addition to normalizing the monotonicity loss by the number of target positions, also normalize loss by valid source positions in batch.')
+    params.add_argument('--attention-monotonicity-ignore-prefix',
+                              action="store_true",
+                              help='Only compute average position for monotonicity loss on source tokens after <sep>. If not set: compute average positions over all source tokens.')
+    params.add_argument('--monotonicity-on-heads',
+                              type=multiple_values(num_values=2, greater_or_equal=1),
+                              default=None,
+                              help='Apply monotonicity loss only to attention heads specified with m:n, e.g. 1:1 will score only first head, 2:4 will score heads 2, 3 and 4 (only applicable with multi-head attention). If not set: apply loss to all heads: None. Default: %(default)s.')
+    params.add_argument('--monotonicity-on-layers',
+                              type=multiple_values(num_values=2, greater_or_equal=1),
+                              default=None,
+                              help='Calculate monotonicity loss only on specified layers m:n, e.g. 1:1 will score only first layer, 2:4 will score layers 2, 3 and 4. If not set: calculate loss on all layers. Default: %(default)s.')
+    params.add_argument('--checkpoint-decoder-beam-size',
+                              type=int,
+                              default=5,
+                              help='Beam size for checkpoint decoding. Default: %(default)s.')
+
+def add_attention_monotonicity_scoring_args(params):
+    params = params.add_argument_group("Parameters for scoring monotonicity with attention on positional embeddings")
+    params.add_argument('--attention-monotonicity-scoring',
+                              action='store_true',
+                              help="Print monotonicity score of decoder-encoder attention.")
+    params.add_argument('--attention-monotonicity-scoring-margin',
+                              type=float,
+                              help="Margin for scoring the monotonicity of attention. Default: Use margin from model config or margin=0 if not set in config.")
+    params.add_argument('--monotonicity-scoring-on-heads',
+                              type=multiple_values(num_values=2, greater_or_equal=1),
+                              default=None,
+                              help='Score monotonicity loss only on specified attention heads m:n, e.g. 1:1 will score only first head, 2:4 will score heads 2, 3 and 4 (only applicable with multi-head attention). If not set: score all heads. Default: %(default)s.')
+    params.add_argument('--monotonicity-scoring-on-layers',
+                              type=multiple_values(num_values=2, greater_or_equal=1),
+                              default=None,
+                              help='Score monotonicity loss only on specified layers m:n, e.g. 1:1 will score only first layer, 2:4 will score layers 2, 3 and 4. If not set: score all layers. Default: %(default)s.')
+    params.add_argument('--print-attention-scores',
+                              action='store_true',
+                              help="Plot attention scores (per layer/per head). Will print graphic(s) to output folder (one per sample).")
+    params.add_argument('--checkpoint', '-c',
+                               default=None,
+                               type=int,
+                               help='Score with specified checkpoint. Default: score with best model checkpoint.')
 
 def add_train_cli_args(params):
     add_training_io_args(params)
@@ -1179,6 +1238,7 @@ def add_train_cli_args(params):
     add_training_args(params)
     add_device_args(params)
     add_logging_args(params)
+    add_monotonicity_loss_args(params)
 
 
 def add_translate_cli_args(params):
@@ -1192,6 +1252,7 @@ def add_score_cli_args(params):
     add_vocab_args(params)
     add_device_args(params)
     add_batch_args(params, default_batch_size=500)
+    add_attention_monotonicity_scoring_args(params)
 
     params = params.add_argument_group("Scoring parameters")
 
@@ -1387,6 +1448,7 @@ def add_inference_args(params):
                                default=0.9,
                                type=float,
                                help='Threshold to consider a soft alignment a sure alignment. Default: %(default)s.')
+
 
     # common params with score CLI
     add_length_penalty_args(decode_params)
